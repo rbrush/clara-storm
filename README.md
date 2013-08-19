@@ -3,6 +3,8 @@
 A proof-of-concept [Clara Rules](https://github.com/rbrush/clara-rules) host that allows running of rules over a the [Storm processing system](http://storm-project.net).
 
 ## How it works
+_NOTE: while building a more sophisticated test, I found the current model I used for mapping distributed memory onto Storm is flawed, in that by creating cycles in its processing topology it introduces the possibility of deadlock, where all bolts are blocked on downstream processing of the Rete network, which is blocked on those same bolts. There are ways to work around this like increasing the number of bolts available, but this is a workaround at best. A more permanent solution is needed._
+
 See the [Clara Rules](https://github.com/rbrush/clara-rules) documentation for an understanding of the rules engine itself. This project distributes the engine's working memory across a Storm topology, making it possible to scale and process very large data streams with simple, declarative rules.
 
 Clara makes distributed rules possible with some simple constraints in the engine itself. First, all facts used by Clara are immutable, which greatly simplifies sharing in a distributed environment
