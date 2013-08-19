@@ -4,7 +4,7 @@
             [clojure.set :as set]
             [clojure.edn :as edn]
             [backtype.storm.clojure :refer [emit-bolt! ack! defbolt bolt bolt-spec]])
-  (:import [clara.rules.engine ITransport LocalTransport]
+  (:import [clara.rules.engine ITransport LocalTransport ProductionNode]
            [backtype.storm.drpc ReturnResults DRPCSpout LinearDRPCTopologyBuilder]))
 
 (def FACT-STREAM "fact")
@@ -70,8 +70,12 @@
             
             (if activation 
               (eng/left-activate node bindings tokens memory transport)
-              (eng/left-retract node bindings tokens memory transport)))
-          
+              (eng/left-retract node bindings tokens memory transport))
+
+            ;; If the node is a production node, fire the rules.
+            (when (isa? (class node) ProductionNode)
+              (eng/fire-rules* network [node] memory transport)))
+
           WME-STREAM
           (let [node (hash-to-node (.getValue tuple 0))
                 join-bindings (.getValue tuple 1)
@@ -81,7 +85,7 @@
             (if activation
               (eng/right-activate node join-bindings elements memory transport)
               (eng/right-retract node join-bindings elements memory transport)))
-
+          
           QUERY-STREAM
           (let [node (hash-to-node (.getValue tuple 0))
                 params (.getValue tuple 1)
@@ -101,7 +105,7 @@
                     {:params [rules]}
 
   [tuple collector]
-  (let [[node-id bindings] (edn/read-string (.getValue tuple 0))
+  (let [[node-id bindings] (read-string (.getValue tuple 0))
         return-info (.getValue tuple 1)]    
     (emit-bolt! collector
                 [node-id bindings return-info]
@@ -112,20 +116,41 @@
 (defn mk-clara-bolts 
   "Returns a bolt map that can be conj'd onto the rest of a topology structure
    that can be passed in as the bolt argument to the storm's topology Clojure function."
-  [ruleset fact-source-id query-source-id]
+  ([ruleset fact-source-ids]
+     {"clara-bolt"  (bolt-spec
+                     (into
+                      {["clara-bolt" WME-STREAM] ["node-id" "bindings"],
+                       ["clara-bolt" TOKEN-STREAM] ["node-id" "bindings"]}
+        
+                      ;; Add all fact sources to the bolt spec.
+                      (for [fact-source-id fact-source-ids]
+                        [[fact-source-id FACT-STREAM] :shuffle]))
 
-  {"query-bolt" (bolt-spec {query-source-id :shuffle} (query-bolt ruleset))
+                     (clara-bolt ruleset)
 
-   "clara-bolt" (bolt-spec
-                 {["query-bolt" QUERY-STREAM] ["node-id" "bindings"],
-                  [fact-source-id FACT-STREAM] :shuffle,
-                  ["clara-bolt" WME-STREAM] ["node-id" "bindings"],
-                  ["clara-bolt" TOKEN-STREAM] ["node-id" "bindings"]}
-                 (clara-bolt ruleset)),
+                     :p 100)})
 
-   "query-returner" (bolt-spec {["clara-bolt" QUERY-STREAM] :shuffle} (new ReturnResults))})
+  ([ruleset fact-source-ids query-source-id]
+     
+     {"query-bolt" (bolt-spec {query-source-id :shuffle} (query-bolt ruleset)),
+
+      "clara-bolt" (bolt-spec
+                    (into 
+                     {["query-bolt" QUERY-STREAM] ["node-id" "bindings"],
+                      ["clara-bolt" WME-STREAM] ["node-id" "bindings"],
+                      ["clara-bolt" TOKEN-STREAM] ["node-id" "bindings"]}
+
+                     ;; Add all fact sources to the bolt spec.
+                      (for [fact-source-id fact-source-ids]
+                        [[fact-source-id FACT-STREAM] :shuffle]))
+
+                     (clara-bolt ruleset)),
+
+       "query-returner" (bolt-spec {["clara-bolt" QUERY-STREAM] :shuffle} (new ReturnResults))}))
 
 (defn query-storm [drpc name network query params]
    (let [query-node (get-in network [:query-nodes query])]
 
-     (edn/read-string (.execute drpc name (pr-str [((:node-to-id network) query-node) params])))))
+     ;; TODO: We should probably use the EDN reader here, although this is
+     ;; an internal call. Should find a way to register the expected query results with EDN.
+     (read-string (.execute drpc name (pr-str [((:node-to-id network) query-node) params])))))

@@ -10,8 +10,8 @@
   (Temperature (< temperature 32) (== ?loc location)))
 
 (defrule is-cold-and-windy
-  (Temperature (< temperature 20) (== ?t temperature))
-  (WindSpeed (> windspeed 30) (== ?w windspeed))
+  (Temperature (< temperature 32) (== ?t temperature) (== ?loc location))
+  (WindSpeed (> windspeed 30) (== ?w windspeed) (== ?loc location))
   =>
   (insert! (->ColdAndWindy ?t ?w)))
 
