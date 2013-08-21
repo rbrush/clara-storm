@@ -126,9 +126,7 @@
                       (for [fact-source-id fact-source-ids]
                         [[fact-source-id FACT-STREAM] :shuffle]))
 
-                     (clara-bolt ruleset)
-
-                     :p 100)})
+                     (clara-bolt ruleset))})
 
   ([ruleset fact-source-ids query-source-id]
      
