@@ -5,7 +5,9 @@
             [clojure.edn :as edn]
             [backtype.storm.clojure :refer [emit-bolt! ack! defbolt bolt bolt-spec]])
   (:import [clara.rules.engine ITransport LocalTransport ProductionNode]
-           [backtype.storm.drpc ReturnResults DRPCSpout LinearDRPCTopologyBuilder]))
+           [backtype.storm.drpc ReturnResults DRPCSpout LinearDRPCTopologyBuilder]
+           [backtype.storm.generated GlobalStreamId Grouping NullStruct]
+           [backtype.storm.utils Utils]))
 
 (def FACT-STREAM "fact")
 (def TOKEN-STREAM "token")
@@ -15,31 +17,31 @@
 ;; TODO: transport should determine if item can be processed locally,
 ;; e.g. any node that doesn't perform a join operation.
 
-(deftype StormTransport [collector anchor node-to-hash]
+(deftype StormTransport [collector anchor]
   ITransport
   (send-elements [transport memory nodes elements]
     (doseq [[bindings element-group] (group-by :bindings elements)
             node nodes
             :let [join-bindings (select-keys bindings (eng/get-join-keys node))]]
-      (emit-bolt! collector [(node-to-hash node) join-bindings element-group true] :anchor anchor :stream WME-STREAM)))
+      (emit-bolt! collector [(:id node) join-bindings element-group true] :anchor anchor :stream WME-STREAM)))
 
   (send-tokens [transport memory nodes tokens]
     (doseq [[bindings token-group] (group-by :bindings tokens)
             node nodes
             :let [join-bindings (select-keys bindings (eng/get-join-keys node))]]
-      (emit-bolt! collector [(node-to-hash node) join-bindings token-group true] :anchor anchor :stream TOKEN-STREAM)))
+      (emit-bolt! collector [(:id node) join-bindings token-group true] :anchor anchor :stream TOKEN-STREAM)))
 
   (retract-elements [transport memory nodes elements]
     (doseq [[bindings element-group] (group-by :bindings elements)
             node nodes
             :let [join-bindings (select-keys bindings (eng/get-join-keys node))]]
-      (emit-bolt! collector [(node-to-hash node) join-bindings element-group false] :anchor anchor :stream WME-STREAM)))
+      (emit-bolt! collector [(:id node) join-bindings element-group false] :anchor anchor :stream WME-STREAM)))
 
   (retract-tokens [transport memory nodes tokens]
       (doseq [[bindings token-group] (group-by :bindings tokens)
             node nodes
             :let [join-bindings (select-keys bindings (eng/get-join-keys node))]]
-      (emit-bolt! collector [(node-to-hash node) join-bindings token-group false] :anchor anchor :stream TOKEN-STREAM))))
+      (emit-bolt! collector [(:id node) join-bindings token-group false] :anchor anchor :stream TOKEN-STREAM))))
 
 
 (defbolt clara-bolt {WME-STREAM ["node-id" "bindings" "elements" "activation"]
@@ -47,19 +49,19 @@
                      QUERY-STREAM ["result" "return-info"]} 
                     {:prepare :true :params [rules]}
   [conf context collector]
-  (let [network (eng/load-rules rules)
-        bolt-memory (atom (eng/local-memory network (LocalTransport.)))
-        hash-to-node (:id-to-node network)
-        node-to-hash (:node-to-id network)]
+  (let [session (apply eng/load-rules rules)
+        bolt-memory (atom (eng/local-memory session (LocalTransport.)))
+        get-alphas-fn (eng/create-get-alphas-fn type session) ;; TODO: use a different type function.
+        hash-to-node (:id-to-node session)]
     (bolt
      (execute [tuple]
       (let [memory (mem/to-transient @bolt-memory)
-            transport (StormTransport. collector tuple node-to-hash)]       
+            transport (StormTransport. collector tuple)]       
         (condp = (.getSourceStreamId tuple)
 
           FACT-STREAM
           (doseq [[cls fact-group] (group-by class (.getValue tuple 0)) 
-                  root (get-in network [:alpha-roots cls])]
+                  root (get-in session [:alpha-roots cls])]
             (eng/alpha-activate root fact-group memory transport))
 
           TOKEN-STREAM 
@@ -74,7 +76,7 @@
 
             ;; If the node is a production node, fire the rules.
             (when (isa? (class node) ProductionNode)
-              (eng/fire-rules* network [node] memory transport)))
+              (eng/fire-rules* session [node] memory transport get-alphas-fn)))
 
           WME-STREAM
           (let [node (hash-to-node (.getValue tuple 0))
@@ -113,42 +115,65 @@
                 :stream QUERY-STREAM)
     (ack! collector tuple)))
 
-(defn mk-clara-bolts 
-  "Returns a bolt map that can be conj'd onto the rest of a topology structure
-   that can be passed in as the bolt argument to the storm's topology Clojure function."
-  ([ruleset fact-source-ids]
-     {"clara-bolt"  (bolt-spec
-                     (into
-                      {["clara-bolt" WME-STREAM] ["node-id" "bindings"],
-                       ["clara-bolt" TOKEN-STREAM] ["node-id" "bindings"]}
-        
-                      ;; Add all fact sources to the bolt spec.
-                      (for [fact-source-id fact-source-ids]
-                        [[fact-source-id FACT-STREAM] :shuffle]))
+;; TODO: Create Java API to do so with a specified ruleset and TopologyBuilder.
 
-                     (clara-bolt ruleset))})
+(defn- mk-inputs [inputs]
+  (into {}
+    (for [[stream-id grouping-spec] inputs]
+      [(if (sequential? stream-id)
+         (GlobalStreamId. (first stream-id) (second stream-id))
+         (GlobalStreamId. stream-id Utils/DEFAULT_STREAM_ID))
+       (Grouping/shuffle (NullStruct.))])))
 
-  ([ruleset fact-source-ids query-source-id]
-     
-     {"query-bolt" (bolt-spec {query-source-id :shuffle} (query-bolt ruleset)),
+(defn- add-groupings [declarer inputs]
+  (doseq [[id grouping] (mk-inputs inputs)]
+    (.grouping declarer id grouping)))
 
-      "clara-bolt" (bolt-spec
-                    (into 
-                     {["query-bolt" QUERY-STREAM] ["node-id" "bindings"],
-                      ["clara-bolt" WME-STREAM] ["node-id" "bindings"],
-                      ["clara-bolt" TOKEN-STREAM] ["node-id" "bindings"]}
 
-                     ;; Add all fact sources to the bolt spec.
-                      (for [fact-source-id fact-source-ids]
-                        [[fact-source-id FACT-STREAM] :shuffle]))
+(defn attach-topology
+  "Attach the pipeline to the topology, using logic drawn from Storm's mk-topology function"
+  [builder {:keys [fact-source-ids query-source-id rulesets]}]
+  
+  ;; Create a bolt map that includes the query source and returner if specified.
+  (let [bolt-map (if query-source-id
+                   {"query-bolt" (bolt-spec {query-source-id :shuffle} (query-bolt rulesets))
 
-                     (clara-bolt ruleset)),
+                    "clara-bolt" (bolt-spec
+                                  (into 
+                                   {["query-bolt" QUERY-STREAM] ["node-id" "bindings"],
+                                    ["clara-bolt" WME-STREAM] ["node-id" "bindings"],
+                                    ["clara-bolt" TOKEN-STREAM] ["node-id" "bindings"]}
 
-       "query-returner" (bolt-spec {["clara-bolt" QUERY-STREAM] :shuffle} (new ReturnResults))}))
+                                   ;; Add all fact sources to the bolt spec.
+                                   (for [fact-source-id fact-source-ids]
+                                     [[fact-source-id FACT-STREAM] :shuffle]))
 
-(defn query-storm [drpc name network query params]
-   (let [query-node (get-in network [:query-nodes query])]
+                                  (clara-bolt rulesets))
+                    "query-returner" (bolt-spec {["clara-bolt" QUERY-STREAM] :shuffle} (new ReturnResults))}
+
+                   {"clara-bolt"  (bolt-spec
+                                   (into
+                                    {["clara-bolt" WME-STREAM] ["node-id" "bindings"],
+                                     ["clara-bolt" TOKEN-STREAM] ["node-id" "bindings"]}
+                                    
+                                    ;; Add all fact sources to the bolt spec.
+                                    (for [fact-source-id fact-source-ids]
+                                      [[fact-source-id FACT-STREAM] :shuffle]))
+
+                                   (clara-bolt rulesets))})]
+
+    ;; Add the bolts to the builder.
+    (doseq [[name {bolt :obj p :p conf :conf inputs :inputs}] bolt-map]
+      (-> builder 
+          (.setBolt name bolt (if-not (nil? p) (int p) p)) 
+          (.addConfigurations conf) 
+          (add-groupings inputs))))
+
+  builder)
+
+(defn query-storm [drpc name session query params]
+   (let [query-node (get-in session [:query-nodes query])]
 
      ;; TODO: We should probably use the EDN reader here, although this is
      ;; an internal call. Should find a way to register the expected query results with EDN.
-     (read-string (.execute drpc name (pr-str [((:node-to-id network) query-node) params])))))
+     (read-string (.execute drpc name (pr-str [(:id query-node) params])))))

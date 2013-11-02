@@ -2,7 +2,8 @@
   (:use clojure.test clara.rules.storm)
   (:import [backtype.storm.drpc ReturnResults DRPCSpout
             LinearDRPCTopologyBuilder])
-  (:import [backtype.storm LocalDRPC LocalCluster StormSubmitter])
+  (:import [backtype.storm LocalDRPC LocalCluster StormSubmitter]
+           [backtype.storm.topology TopologyBuilder])
   (:import [clara.rules.testfacts Temperature WindSpeed Cold ColdAndWindy LousyWeather])
   (:use [backtype.storm bootstrap testing])
   (:use [backtype.storm.daemon common])
@@ -22,20 +23,28 @@
 
      (ack [id]))))
 
+(defn mk-test-topology
+  [drpc]
+
+  (let [builder (TopologyBuilder.)]
+    (.setSpout builder "drpc" drpc nil)
+    (.setSpout builder "facts" fact-spout nil)
+    (attach-topology builder
+                     {:fact-source-ids ["facts"]
+                      :query-source-id (if drpc "drpc" nil)
+                      :rulesets ['clara.sample-ruleset]})
+    (.createTopology builder)))
+
 (deftest test-simple-query []
   (let [drpc (LocalDRPC.)
         spout (DRPCSpout. "test" drpc)
         cluster (LocalCluster.)
-        topology (topology 
-                  {"drpc" (spout-spec spout)
-                   "facts" (spout-spec fact-spout)}
 
-                  ;; Bolt topology defined by Clara.
-                  (mk-clara-bolts 'clara.sample-ruleset ["facts"] "drpc"))
+        test-topology (mk-test-topology spout)
 
         rulebase (eng/load-rules 'clara.sample-ruleset)]
 
-    (.submitTopology cluster "test" {} topology)
+    (.submitTopology cluster "test" {} test-topology)
 
     ;; Let some events process.
     (Thread/sleep 2000)    
@@ -51,23 +60,19 @@
   (let [drpc (LocalDRPC.)
         spout (DRPCSpout. "test" drpc)
         cluster (LocalCluster.)
-        topology (topology 
-                  {"drpc" (spout-spec spout)
-                   "facts" (spout-spec fact-spout)}
 
-                  ;; Bolt topology defined by Clara.
-                  (mk-clara-bolts 'clara.sample-ruleset ["facts"] "drpc"))
+        test-topology (mk-test-topology spout)
 
         rulebase (eng/load-rules 'clara.sample-ruleset)]
 
-    (.submitTopology cluster "test" {} topology)
+    (.submitTopology cluster "test" {} test-topology)
 
     ;; Let some events process.
     (Thread/sleep 4000)    
 
     ;; Ensure the query matches as expected.
     (is (= {:?fact #clara.rules.testfacts.ColdAndWindy{:temperature 20, :windspeed 40}}
-           (first(query-storm drpc "test" rulebase clara.sample-ruleset/find-cold-and-windy {}))))
+           (first (query-storm drpc "test" rulebase clara.sample-ruleset/find-cold-and-windy {}))))
     
     (.shutdown cluster)
     (.shutdown drpc)))
