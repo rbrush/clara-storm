@@ -115,8 +115,6 @@
                 :stream QUERY-STREAM)
     (ack! collector tuple)))
 
-;; TODO: Create Java API to do so with a specified ruleset and TopologyBuilder.
-
 (defn- mk-inputs [inputs]
   (into {}
     (for [[stream-id grouping-spec] inputs]
@@ -133,7 +131,7 @@
 (defn attach-topology
   "Attach the pipeline to the topology, using logic drawn from Storm's mk-topology function"
   [builder {:keys [fact-source-ids query-source-id rulesets]}]
-  
+ 
   ;; Create a bolt map that includes the query source and returner if specified.
   (let [bolt-map (if query-source-id
                    {"query-bolt" (bolt-spec {query-source-id :shuffle} (query-bolt rulesets))

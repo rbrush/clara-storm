@@ -51,7 +51,7 @@
 
     ;; Ensure the query matches as expected.
     (is (= {:?loc "MCI"} 
-           (first(query-storm drpc "test" rulebase clara.sample-ruleset/freezing-locations {}))))
+           (first (query-storm drpc "test" rulebase clara.sample-ruleset/freezing-locations {}))))
     
     (.shutdown cluster)
     (.shutdown drpc)))
@@ -77,3 +77,37 @@
     (.shutdown cluster)
     (.shutdown drpc)))
 
+(deftest test-java-client []
+  (let [drpc (LocalDRPC.)
+        spout (DRPCSpout. "test" drpc)
+        cluster (LocalCluster.)
+
+        ; Wire up topology with our drpc and fact spout.
+        builder (doto (TopologyBuilder.)
+                  (.setSpout "drpc" spout nil)
+                  (.setSpout "facts" fact-spout nil))
+
+        ;; Attach our Clara rules to the facts and drpc and
+        ;; get our query client.
+        client (clara.storm.RuleBolts/attach builder
+                                             drpc
+                                             ["facts"]
+                                             "drpc"
+                                             (doto (make-array String 1) 
+                                                   (aset 0 "clara.sample-ruleset")))
+        test-topology (.createTopology builder)]
+
+    ;; Run the topology.
+    (.submitTopology cluster "test" {} test-topology)
+
+    ;; Let some events process.
+    (Thread/sleep 2000)    
+
+    ;; Ensure the query matches as expected.
+    (is (= "MCI" 
+           (.getResult 
+            (first (.query client "clara.sample-ruleset/freezing-locations"))
+            "?loc")))
+    
+    (.shutdown cluster)
+    (.shutdown drpc)))
