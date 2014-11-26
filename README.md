@@ -1,3 +1,8 @@
+# DEPRECATED
+clara-storm was an experiment in distributing production rule working memory in storm, but has not been maintained and may not work against newer versions of either Clara or Storm. 
+
+Of course, users may use Clara as a library with Storm -- or any other JVM-based system -- but this project has been tabled due to lack of time. I can imagine it be resurrected in the future in some updated form but there are no immediate plans to do so.
+
 # clara-storm
 
 A proof-of-concept [Clara Rules](https://github.com/rbrush/clara-rules) host that allows running of rules over a the [Storm processing system](http://storm-project.net).
